@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import OrdinalEncoder, StandardScaler,OneHotEncoder
+from sklearn.preprocessing import OrdinalEncoder, StandardScaler,OneHotEncoder, FunctionTransformer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold, RandomizedSearchCV,train_test_split
 from collections import defaultdict
@@ -14,6 +14,17 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 import shap
+from joblib import Memory
+from xgboost import XGBRegressor
+from xgboost import XGBRegressor, callback as xcb
+from xgboost.callback import EarlyStopping
+from sklearn.tree import DecisionTreeRegressor
+from lightgbm import LGBMRegressor
+from sklearn import set_config
+set_config(transform_output="pandas")  # ✅ 讓 ColumnTransformer 自動輸出 DataFrame
+from sklearn.base import BaseEstimator, TransformerMixin
+import time
+import polars as pl
 
 # =========================
 # 視覺化字型（可留可去）
@@ -36,32 +47,200 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 data_path = os.path.join(BASE_DIR, "data", "raw", "化金線自主檢查表_all.csv")
 df = pd.read_csv(data_path, encoding="big5")
 
+df = pd.read_csv(data_path, encoding="big5")
+
 print("=== 欄位缺值數量 ===")
 print(df.isnull().sum())
+
 
 # =========================
 # 目標與特徵宣告（原始欄位名）
 # =========================
 label_col = "金"
 
-# 原始特徵（注意：此處不做全域編碼；在 fold 內才做）
-# 類別欄位在每個 fold 內用 OrdinalEncoder 產生 *_Code 取代
-base_raw_features = ['金厚下限', '板子類型', '線別', 'MTO2', '電流值2', '槽次2']
-# base_raw_features = ['電流值1', '電流值2', 'MTO1','MTO2','料號','短批','子批','批號']
-
-# 每個 fold 內用訓練資料的眾數補值
-impute_cols_with_mode = ['子批', '金厚上限', '槽次2']
-# impute_cols_with_mode = ['子批']
-
-# 在每個 fold 內做 Ordinal 編碼（避免洩漏） # label encoder
-categorical_cols_for_ordinal = ['板子類型', '線別', '槽次2']
-
 # features = ['歸屬班別','料號','短批','子批','批號','數量','MTO1','MTO2','檢查型態','項目','鎳','金厚下限','金厚上限','鎳厚下限','鎳厚上限','板子類型','電流值1','電流值2',
 #             '槽次1','槽次2','線別']
-features = ['金厚下限','板子類型','料號','歸屬班別','批號','短批','金厚上限','線別','槽次1','鎳','數量']
+features = ['金厚下限','板子類型','歸屬班別','金厚上限','線別','槽次1','鎳','數量','檢查型態','鎳厚下限','MTO1','鎳厚上限','電流值1','電流值2','MTO2','項目']
 #features = ['電流值1','電流值2','MTO1','MTO2','子批','料號','短批','批號']
 
-rene_features = ['電流值1','電流值2','MTO1','MTO2','子批','料號','短批','批號']
+
+# =========================
+# XGBOOST 參數搜尋空間
+# =========================
+# def get_param_dist_xgb():
+#     """XGBoost 高維度資料適用的 RandomizedSearch 參數空間（已移除 'auto'）"""
+#     return {
+#         # === 樹的結構參數（偏保守設定，避免高維特徵過擬合） ===
+#         "model__n_estimators": np.linspace(300, 900, 7, dtype=int),  # 樹數量
+#         "model__max_depth": [3, 5, 7, 9, 12],                       # 避免太深導致高維過擬合
+#         "model__min_child_weight": [1, 3, 5, 7, 10],                 # 節點最小權重和
+        
+#         # === 學習率與收斂控制（learning rate 較低以提升穩定性） ===
+#         "model__learning_rate": [0.01, 0.05, 0.1, 0.15, 0.2],        # Boosting 步長，0.05~0.1 較穩定
+#         "model__gamma": [0, 0.5, 1, 2, 5],                           # 分裂懲罰項，增加可泛化性
+        
+#         # === 子樣本與特徵取樣（高維特徵需更高隨機性以控制方差） ===
+#         "model__subsample": [0.6, 0.7, 0.8, 0.9, 1.0],               # 行取樣比例（樣本層級）
+#         "model__colsample_bytree": [0.3, 0.4, 0.5, 0.6, 0.7],        # 列取樣比例（特徵層級，特別重要）
+        
+#         # === 正則化控制（避免高維權重爆炸） ===
+#         "model__reg_lambda": [0.5, 1.0, 1.5, 2.0, 3.0],              # L2 正則化
+#         "model__reg_alpha": [0, 0.1, 0.3, 0.5, 1.0],                 # L1 正則化
+
+#         # === 模型結構 ===
+#         "model__booster": ["gbtree", "dart"],                        # dart 支援 dropout，降低過擬合
+#         "model__tree_method": ["hist"],                              # 適合中大型資料集
+#     }
+
+def parse_dates(df: pd.DataFrame, date_cols):
+    out = df.copy()
+    for c in date_cols:
+        try:
+            out[c] = pd.to_datetime(out[c], errors="coerce")
+        except Exception:
+            out[c] = pd.NaT
+    return out
+
+
+def add_date_features(df: pd.DataFrame, date_col: str):
+    out = df.copy()
+    col = date_col
+    out[f"{col}_year"] = out[col].dt.year
+    out[f"{col}_month"] = out[col].dt.month
+    out[f"{col}_day"] = out[col].dt.day
+    out[f"{col}_dow"] = out[col].dt.dayofweek
+    out[f"{col}_hour"] = out[col].dt.hour
+    return out
+
+# 可列出輸出特徵名稱的週期轉換器
+class CyclicalEncoder(BaseEstimator, TransformerMixin):
+    """可列出輸出特徵名稱的週期轉換器"""
+    def fit(self, X, y=None):
+        self.columns_ = X.columns if isinstance(X, pd.DataFrame) else [f"col_{i}" for i in range(X.shape[1])]
+        return self
+
+    def transform(self, X):
+        if isinstance(X, np.ndarray):
+            X = pd.DataFrame(X, columns=self.columns_)
+        return cyclical_encode(X)
+
+    def get_feature_names_out(self, input_features=None):
+        # 用空資料框跑一遍 cyclical_encode() 取得新欄位名
+        if input_features is None:
+            input_features = getattr(self, "columns_", [])
+        df_temp = pd.DataFrame({c: [0] for c in input_features})
+        df_encoded = cyclical_encode(df_temp)
+        return df_encoded.columns.to_numpy()
+
+def cyclical_encode(df):
+    df = df.copy()
+
+    for c in df.columns:
+        if c.endswith("_hour"):
+            df[f"{c}_sin"] = np.sin(2 * np.pi * df[c] / 24)
+            df[f"{c}_cos"] = np.cos(2 * np.pi * df[c] / 24)
+            # time_features.append(f"{c}_sin")
+            # time_features.append(f"{c}_cos")
+            #out_cols += [f"{c}_sin", f"{c}_cos"]
+        elif c.endswith("_dow"):
+            df[f"{c}_sin"] = np.sin(2 * np.pi * df[c] / 7)
+            df[f"{c}_cos"] = np.cos(2 * np.pi * df[c] / 7)
+            #out_cols += [f"{c}_sin", f"{c}_cos"]
+            # time_features.append(f"{c}_sin")
+            # time_features.append(f"{c}_cos")
+        elif c.endswith("_month"):
+            df[f"{c}_sin"] = np.sin(2 * np.pi * df[c] / 12)
+            df[f"{c}_cos"] = np.cos(2 * np.pi * df[c] / 12)
+            #out_cols += [f"{c}_sin", f"{c}_cos"]
+            # time_features.append(f"{c}_sin")
+            # time_features.append(f"{c}_cos")
+
+    return df
+
+# def cyclical_encode(df,time_features):
+#     df = df.copy()
+#     #out_cols = []
+#     for c in df.columns:
+#         if c.endswith("_hour"):
+#             df[f"{c}_sin"] = np.sin(2 * np.pi * df[c] / 24)
+#             df[f"{c}_cos"] = np.cos(2 * np.pi * df[c] / 24)
+#             time_features.append(f"{c}_sin")
+#             time_features.append(f"{c}_cos")
+#             #out_cols += [f"{c}_sin", f"{c}_cos"]
+#         elif c.endswith("_dow"):
+#             df[f"{c}_sin"] = np.sin(2 * np.pi * df[c] / 7)
+#             df[f"{c}_cos"] = np.cos(2 * np.pi * df[c] / 7)
+#             #out_cols += [f"{c}_sin", f"{c}_cos"]
+#             time_features.append(f"{c}_sin")
+#             time_features.append(f"{c}_cos")
+#         elif c.endswith("_month"):
+#             df[f"{c}_sin"] = np.sin(2 * np.pi * df[c] / 12)
+#             df[f"{c}_cos"] = np.cos(2 * np.pi * df[c] / 12)
+#             #out_cols += [f"{c}_sin", f"{c}_cos"]
+#             time_features.append(f"{c}_sin")
+#             time_features.append(f"{c}_cos")
+#     return df
+
+
+# ==== LightGBM 參數搜尋空間 ====
+def get_param_dist_lgb():
+    """LightGBM 的 RandomizedSearch 參數空間"""
+    return {
+        "model__n_estimators": [200, 400, 600, 800, 1000],
+        "model__learning_rate": [0.01, 0.05, 0.1, 0.2],
+        "model__num_leaves": [15, 31, 63, 127],
+        "model__max_depth": [-1, 5, 10, 15],
+        "model__min_child_samples": [5, 10, 20, 40],
+        "model__subsample": [0.6, 0.8, 1.0],
+        "model__colsample_bytree": [0.6, 0.8, 1.0],
+        "model__reg_lambda": [0, 0.1, 1, 5, 10],   # L2 regularization
+        "model__reg_alpha": [0, 0.1, 0.5, 1],      # L1 regularization
+        "model__boosting_type": ["gbdt", "dart"],  # dart 支援 dropout boosting
+    }
+
+
+def get_param_dist_dt():
+    """Decision Tree 專用的 RandomizedSearchCV 搜尋空間"""
+    return {
+        "model__max_depth": [3, 5, 7, 10, 15, 20, None],  # 樹的最大深度
+        "model__min_samples_split": [2, 5, 10, 20],       # 分裂所需的最小樣本數
+        "model__min_samples_leaf": [1, 2, 4, 8, 10],      # 葉節點最小樣本數
+        "model__max_features": ["sqrt", "log2", None],    # 分裂時考慮的特徵數
+        "model__criterion": ["squared_error", "friedman_mse"],  # 損失函數
+        "model__splitter": ["best", "random"]             # 分裂策略
+    }
+
+def get_param_dist_xgb():
+    # 收斂後的「資源友善版」搜尋空間
+    return {
+        # "model__n_estimators": np.linspace(200, 500, 7, dtype=int),  # 小一點，交給 early stopping
+        # "model__max_depth": [3, 5, 7],                               # 限制樹深
+        # "model__min_child_weight": [3, 5, 7, 10],                    # 增加節點最小權重，抑制過擬合/計算量
+        # "model__learning_rate": [0.03, 0.05, 0.07, 0.1],
+        # "model__gamma": [0, 0.5, 1, 2],
+        # "model__subsample": [0.6, 0.7, 0.8],
+        # "model__colsample_bytree": [0.3, 0.4, 0.5],
+        # "model__reg_lambda": [0.8, 1.0, 1.5, 2.0],
+        # "model__reg_alpha": [0, 0.1, 0.3, 0.5],
+        # "model__booster": ["gbtree", "dart"],
+        # "model__tree_method": ["hist"],  # 有 GPU 再改 "gpu_hist"
+        # # "model__max_bin": [128, 256]   # 如記憶體吃緊可打開（對 hist 有效）
+
+        "model__n_estimators": randint(1495, 1500),  # 小一點，交給 early stopping
+        #"model__n_estimators": [200, 300, 400, 500],
+        "model__max_depth": [3, 5, 7],                               # 限制樹深
+        "model__min_child_weight": [3, 5, 7, 10],                    # 增加節點最小權重，抑制過擬合/計算量
+        "model__learning_rate": [0.03, 0.05, 0.07, 0.1],
+        "model__gamma": [0, 0.5, 1, 2],
+        "model__subsample": [0.6, 0.7, 0.8],
+        "model__colsample_bytree": [0.3, 0.4, 0.5],
+        "model__reg_lambda": [0.8, 1.0, 1.5, 2.0],
+        "model__reg_alpha": [0, 0.1, 0.3, 0.5],
+        "model__booster": ["gbtree"],
+        "model__tree_method": ["hist"],  # 有 GPU 再改 "gpu_hist"
+        # "model__max_bin": [128, 256]   # 如記憶體吃緊可打開（對 hist 有效）
+    }
+
 
 # =========================
 # RF 參數搜尋空間
@@ -138,10 +317,16 @@ def one_hot(df_cat):
     return X_encoded_df
 
 # ==== [Preprocess & Model Builders] ==========================================
-def build_preprocessor(df: pd.DataFrame, features: list):
+def build_preprocessor(df: pd.DataFrame, features: list, time_features: list):
     """建構 ColumnTransformer 前處理管線"""
     cat_cols = [c for c in features if df[c].dtype == "object"]
-    num_cols = [c for c in features if c not in cat_cols]
+    num_cols = [c for c in features if c not in cat_cols and c not in time_features]
+    # num_cols = [
+    #     c for c in features
+    #     if c not in cat_cols
+    #     and c not in time_features
+    #     and not np.issubdtype(df[c].dtype, np.datetime64)
+    # ]
 
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
@@ -149,13 +334,22 @@ def build_preprocessor(df: pd.DataFrame, features: list):
     ])
     categorical_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=True))
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
     ])
+
+    #time_transformer = FunctionTransformer(cyclical_encode, validate=False)
+    
+
+    # 👉 新增一個「time passthrough」分支
+    #passthrough_transformer = "passthrough"
 
     preprocessor = ColumnTransformer(
         transformers=[
             ("num", numeric_transformer, num_cols),
             ("cat", categorical_transformer, cat_cols),
+            #("time", passthrough_transformer, time_features),  # ✅ 直接帶入不變動
+            #("time", time_transformer, time_features),  # 分支：時間特徵轉週期編碼
+            ("time", CyclicalEncoder(), time_features)
         ]
     )
     return preprocessor, cat_cols, num_cols
@@ -167,6 +361,29 @@ outer_kf = KFold(n_splits=OUTER_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
 fold_metrics = []
 fi_collector = defaultdict(list)  # 跨折特徵重要度彙整
+
+
+# ---- Date features ----
+used_time_col = None
+
+used_time_col = "生產日期"
+
+if used_time_col:
+    df = parse_dates(df, [used_time_col])
+    df = add_date_features(df, used_time_col)
+    #time_features = []
+    time_features = [
+        f"{used_time_col}_year",
+        f"{used_time_col}_month",
+        f"{used_time_col}_day",
+        f"{used_time_col}_dow", # day of week
+        f"{used_time_col}_hour"
+    ]
+    features.extend(time_features)
+else:
+    time_features = []
+
+#df = cyclical_encode(df,time_features)  # 這裡直接呼叫你的函式
 
 
 for fold_idx, (train_idx, test_idx) in enumerate(outer_kf.split(df), start=1):
@@ -195,6 +412,37 @@ for fold_idx, (train_idx, test_idx) in enumerate(outer_kf.split(df), start=1):
     
     cat_cols = [c for c in features if df_train[c].dtype == "object"]
     num_cols = [c for c in features if c not in cat_cols]
+
+
+    # used_time_col = "生產日期"
+
+    # if used_time_col:
+    #     df_train = parse_dates(df_train, [used_time_col])
+    #     df_train = add_date_features(df_train, used_time_col)
+    #     #time_features = []
+    #     time_features = [
+    #         f"{used_time_col}_year",
+    #         f"{used_time_col}_month",
+    #         f"{used_time_col}_day",
+    #         f"{used_time_col}_dow", # day of week
+    #         f"{used_time_col}_hour"
+    #     ]
+    #     #features.extend(time_features)
+    # else:
+    #     time_features = []
+    
+    # df_train = cyclical_encode(df_train,time_features)  # 這裡直接呼叫你的函式
+
+    # if used_time_col:
+    #     df_test = parse_dates(df_test, [used_time_col])
+    #     df_test = add_date_features(df_test, used_time_col)
+    # else:
+    #     time_features = []
+
+    # df_test = cyclical_encode_v2(df_test,time_features)  # 這裡直接呼叫你的函式
+
+
+
 
     # if num_cols:
     #     df_num = df[num_cols].fillna(df_train[num_cols].median())
@@ -273,32 +521,140 @@ for fold_idx, (train_idx, test_idx) in enumerate(outer_kf.split(df), start=1):
 
     # iqr_clip_feature = [f for f in base_features if f not in exclude_cols and "_Code" not in f]
 
-    # 4) 組合資料
-    all_features = df_train.columns.to_list()
-    all_features = [f for f in features if f not in label_col]
+    # === 過濾掉時間衍生特徵，只留給 preprocessor 用的欄位 ===
+    features_for_preproc = [f for f in features if f not in time_features]
+
+    # === 傳給 build_preprocessor 的就是排除後的版本 ===
+    preprocessor, cat_cols, num_cols = build_preprocessor(df, features_for_preproc , time_features)
+    # print(features_for_preproc)
+    # print(time_features)
+    # exit()
+
+    all_features = features_for_preproc + time_features
+
 
     X_train = df_train[all_features]
     y_train = df_train[label_col].values.ravel()
     X_test  = df_test[all_features]
     y_test  = df_test[label_col].values.ravel()
 
-    preprocessor, cat_cols, num_cols = build_preprocessor(df, features)
+
+    #preprocessor, cat_cols, num_cols = build_preprocessor(df, features)
+
+    inner_cv = KFold(n_splits=INNER_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+
+    # ==== LightGBM 模型 ====
+    # lgb = LGBMRegressor(
+    #     objective="regression",
+    #     random_state=RANDOM_STATE,
+    #     n_jobs=-1,
+    #     verbose=-1,
+    #     force_col_wise=True,   # ✅ 對 ColumnTransformer 輸出最相容
+    # )
+
+    # # ==== Pipeline ====
+    # pipe = Pipeline(steps=[
+    #     ("preprocess", preprocessor),  # 保留你的前處理流程
+    #     ("model", lgb)
+    # ])
+
+    # # ==== RandomizedSearchCV ====
+    # search = RandomizedSearchCV(
+    #     estimator=pipe,
+    #     param_distributions=get_param_dist_lgb(),
+    #     n_iter=N_ITER,
+    #     cv=inner_cv,
+    #     scoring="neg_mean_absolute_error",
+    #     verbose=1,
+    #     n_jobs=-1,
+    #     random_state=RANDOM_STATE,
+    #     refit=True,
+    # )
+
+
+    # 測試 ColumnTransformer 輸出欄位
+    X_train_pre = preprocessor.fit_transform(X_train)
+    print("✅ ColumnTransformer 輸出 shape:", X_train_pre.shape)
+    print("✅ 欄位名稱前10:", X_train_pre.columns.tolist())
+
+    # exit()
+    # exit()
+
+    # ==== 訓練 ====
+    # lgb_model = search.fit(X_train, y_train)
+
+    # # ==== Decision Tree 模型 ====
+    # dt = DecisionTreeRegressor(
+    #     random_state=RANDOM_STATE,
+    # )
+
+    # # ==== Pipeline ====
+    # pipe = Pipeline(steps=[
+    #     ("preprocess", preprocessor),  # 前處理（縮放、編碼等）
+    #     ("model", dt)
+    # ])
+
+    # # ==== RandomizedSearchCV ====
+    # search = RandomizedSearchCV(
+    #     estimator=pipe,
+    #     param_distributions=get_param_dist_dt(),
+    #     n_iter=N_ITER,
+    #     cv=inner_cv,
+    #     scoring="neg_mean_absolute_error",   # 可改 r2 / neg_root_mean_squared_error
+    #     verbose=1,
+    #     n_jobs=-1,
+    #     random_state=RANDOM_STATE,
+    #     refit=True,
+    # )
+
+    # # ==== 訓練 ====
+    # dt_model = search.fit(X_train, y_train)
+
+
+    # # ==== XGBoost 模型 ====
+    # xgb = XGBRegressor(
+    #     objective="reg:squarederror",   # 迴歸任務
+    #     random_state=RANDOM_STATE,
+    #     tree_method="gpu_hist"       # 有 GPU 改 "gpu_hist"
+        
+    # )
+
+    # # ==== Pipeline ====
+    # pipe = Pipeline(steps=[
+    #     ("preprocess", preprocessor),   # 前處理（例如縮放、編碼等）
+    #     ("model", xgb)
+    # ])
+
+    # # ==== RandomizedSearchCV ====
+    # search = RandomizedSearchCV(
+    #     estimator=pipe,
+    #     param_distributions=get_param_dist_xgb(),
+    #     n_iter=N_ITER,
+    #     cv=inner_cv,
+    #     scoring="neg_mean_absolute_error",  # 可改為 r2 / neg_root_mean_squared_error
+    #     verbose=1,
+    #     n_jobs=-1,
+    #     random_state=RANDOM_STATE,
+    #     refit=True,   # 以最佳參數重訓
+    # )
+
+    # # # ==== 訓練 ====
+    # xgb_model = search.fit(X_train, y_train)
 
     # 5) 內層 RandomizedSearchCV + KFold（在訓練 fold 上尋參）
     rf = RandomForestRegressor(random_state=RANDOM_STATE)
 
     pipe = Pipeline(steps=[("preprocess", preprocessor), ("model", rf)])
 
-    inner_cv = KFold(n_splits=INNER_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     search = RandomizedSearchCV(
         estimator=pipe,
-        param_distributions=get_param_dist(),
-        n_iter=N_ITER,
-        cv=inner_cv,
-        scoring="neg_mean_absolute_error",
-        verbose=1,
-        n_jobs=-1,
-        random_state=RANDOM_STATE,
+        param_distributions=get_param_dist(), #要搜尋的「超參數空間（parameter space）」
+        n_iter=N_ITER, # 組合數量
+        cv=inner_cv,  # 交叉驗證的設定
+        scoring="neg_mean_absolute_error", # 模型評分指標
+        verbose=1, # 訓練過程的詳細程度
+        n_jobs=-1, # CPU 平行化數量，-1指全CPU
+        random_state=RANDOM_STATE, # 固定隨機性來源，確保實驗可重現
         refit=True,  # 以最佳參數在整個訓練 fold 重訓
     )
     rf_model = search.fit(X_train, y_train)
@@ -323,7 +679,9 @@ for fold_idx, (train_idx, test_idx) in enumerate(outer_kf.split(df), start=1):
         "MAE":  mae,
         "MSE":  mse,
         "RMSE": rmse,
-        "R2":   r2
+        "R2":   r2,
+        "best_params": search.best_params_,
+        "best_model": search.best_estimator_
     })
     print(f"[Fold {fold_idx}] MAE={mae:.4f}  MSE={mse:.4f}  RMSE={rmse:.4f}  R²={r2:.4f}")
 
@@ -335,9 +693,9 @@ for fold_idx, (train_idx, test_idx) in enumerate(outer_kf.split(df), start=1):
     # ---- 9.1 準備資料（取一個代表性的樣本，避免全量太慢） ----------------------
     # SHAP 繪圖對樣本數較敏感，數萬筆以上可抽樣 2000~5000 筆即可呈現趨勢
     #rf_model = pipe.named_steps["model"] 
-
+    #xgb_model = pipe.named_steps["model"] 
     #############################################################
-    # # 抽樣（避免過慢）
+    # 抽樣（避免過慢）
     # def sample_frame(X, n=3000, random_state=42):
     #     return X if len(X) <= n else X.sample(n=n, random_state=random_state)
 
@@ -356,7 +714,8 @@ for fold_idx, (train_idx, test_idx) in enumerate(outer_kf.split(df), start=1):
 
     # # ---- 9.2 計算 SHAP 值 -------------------------------------------------------
     # # 對於樹模型，使用 TreeExplainer（效能/相容性較佳）
-    # explainer = shap.TreeExplainer(rf_model)
+    # explainer = shap.TreeExplainer(lgb_model)
+    # #shap_values = explainer.shap_values(X_shap_tx, check_additivity=False)   # regression: (n_samples, n_features)
     # shap_values = explainer.shap_values(X_shap_tx)   # regression: (n_samples, n_features)
     # # 基準值（期望輸出）
     # expected_value = explainer.expected_value
@@ -471,3 +830,32 @@ if len(fi_collector) > 0:
     }).sort_values("importance_mean", ascending=False)
     print("\n=== 平均特徵重要度（跨折） ===")
     print(fi_avg.to_string(index=False))
+
+
+### 最佳化參數儲存，並重訓後將模型儲存
+
+# from collections import Counter
+# import joblib
+
+# # 統計每次 fold 的最佳參數
+# param_counter = Counter([tuple(sorted(d["best_params"].items())) for d in fold_metrics])
+# final_params = dict(param_counter.most_common(1)[0][0])  # 出現次數最多的組合
+
+# # ✅ 移除前綴 "model__"
+# model_params = {k.replace("model__", ""): v for k, v in final_params.items() if k.startswith("model__")}
+
+
+# # 重建 Pipeline（用同樣的 preprocessor）
+# final_model = Pipeline(steps=[
+#     ("preprocess", preprocessor),  # 或重建新的 fit_transform
+#     ("model", RandomForestRegressor(random_state=42, **model_params))
+# ])
+
+# train_len = int(len(df)*0.8)
+# model_train = df[:train_len]
+# model_test = df[train_len:]
+
+# final_model.fit(model_train[all_features], model_train[label_col])
+# joblib.dump(final_model, "models/final_rf_without_part_num_divide_v2.pkl")
+
+# print("✅ Final model retrained with all data and best params.")
